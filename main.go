@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,6 +19,9 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 )
+
+//go:embed icon.ico
+var iconData []byte
 
 type Metrics struct {
 	CPU        float64 `json:"cpu"`
