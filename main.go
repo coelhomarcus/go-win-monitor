@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/getlantern/systray"
-	"github.com/gorilla/websocket"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 )
@@ -31,16 +31,11 @@ type Metrics struct {
 	GPU        float64 `json:"gpu"`
 }
 
-type AuthMessage struct {
-	Secret string `json:"secret"`
-}
-
 var (
-	apiURL = getEnv("M_WSS_URL", "")
+	apiURL = getEnv("M_API_URL", "")
 	secret = getEnv("M_AGENT_SECRET", "")
 )
 
-// Menu items atualizáveis
 var (
 	menuCPU    *systray.MenuItem
 	menuRAM    *systray.MenuItem
@@ -69,29 +64,34 @@ func onReady() {
 	menuRAM = systray.AddMenuItem("RAM: ---", "")
 	menuGPU = systray.AddMenuItem("GPU: ---", "")
 	systray.AddSeparator()
-	menuStatus = systray.AddMenuItem("Status: Disconnected", "")
+	menuStatus = systray.AddMenuItem("Status: Starting...", "")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Exit the application")
 
-	// Desabilitar click nos items de info
 	menuCPU.Disable()
 	menuRAM.Disable()
 	menuGPU.Disable()
 	menuStatus.Disable()
 
-	// WebSocket loop em goroutine
 	go func() {
+		endpoint := strings.TrimRight(apiURL, "/") + "/pc-stats/report"
+		log.Printf("Reporting to %s", endpoint)
+
 		for {
-			err := run()
-			if err != nil {
-				log.Printf("Connection error: %v. Reconnecting in 5s...", err)
-				setStatus("Disconnected")
+			metrics := collectMetrics()
+			updateMenuMetrics(metrics)
+
+			if err := sendMetrics(endpoint, metrics); err != nil {
+				log.Printf("Report error: %v", err)
+				setStatus("Error")
+			} else {
+				setStatus("Connected")
 			}
-			time.Sleep(5 * time.Second)
+
+			time.Sleep(30 * time.Second)
 		}
 	}()
 
-	// Quit handler
 	go func() {
 		<-mQuit.ClickedCh
 		systray.Quit()
@@ -120,59 +120,28 @@ func updateMenuMetrics(m Metrics) {
 	}
 }
 
-func run() error {
-	log.Printf("Connecting to %s...", apiURL)
-	setStatus("Connecting...")
-
-	conn, _, err := websocket.DefaultDialer.Dial(apiURL, nil)
+func sendMetrics(endpoint string, metrics Metrics) error {
+	body, err := json.Marshal(metrics)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
-	}
-	defer conn.Close()
-
-	auth := AuthMessage{Secret: secret}
-	if err := conn.WriteJSON(auth); err != nil {
-		return fmt.Errorf("auth send: %w", err)
+		return fmt.Errorf("marshal: %w", err)
 	}
 
-	_, msg, err := conn.ReadMessage()
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("auth response: %w", err)
+		return fmt.Errorf("new request: %w", err)
 	}
 
-	var resp map[string]string
-	if err := json.Unmarshal(msg, &resp); err != nil {
-		return fmt.Errorf("auth parse: %w", err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+secret)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
 	}
-	if resp["status"] != "ok" {
-		return fmt.Errorf("auth failed: %s", resp["status"])
-	}
+	defer resp.Body.Close()
 
-	log.Println("Authenticated successfully")
-	setStatus("Connected")
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	if err := sendMetrics(conn); err != nil {
-		return err
-	}
-
-	for range ticker.C {
-		if err := sendMetrics(conn); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func sendMetrics(conn *websocket.Conn) error {
-	metrics := collectMetrics()
-	updateMenuMetrics(metrics)
-
-	if err := conn.WriteJSON(metrics); err != nil {
-		return fmt.Errorf("send metrics: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	return nil
