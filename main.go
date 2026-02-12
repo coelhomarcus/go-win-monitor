@@ -9,8 +9,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/getlantern/systray"
 	"github.com/gorilla/websocket"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
@@ -33,6 +36,15 @@ var (
 	secret = getEnv("M_AGENT_SECRET", "")
 )
 
+// Menu items atualizáveis
+var (
+	menuCPU    *systray.MenuItem
+	menuRAM    *systray.MenuItem
+	menuGPU    *systray.MenuItem
+	menuStatus *systray.MenuItem
+	menuMu     sync.Mutex
+)
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -41,17 +53,72 @@ func getEnv(key, fallback string) string {
 }
 
 func main() {
-	for {
-		err := run()
-		if err != nil {
-			log.Printf("Connection error: %v. Reconnecting in 5s...", err)
+	systray.Run(onReady, onExit)
+}
+
+func onReady() {
+	systray.SetIcon(iconData)
+	systray.SetTitle("")
+	systray.SetTooltip("Computer Monitor")
+
+	menuCPU = systray.AddMenuItem("CPU: ---", "")
+	menuRAM = systray.AddMenuItem("RAM: ---", "")
+	menuGPU = systray.AddMenuItem("GPU: ---", "")
+	systray.AddSeparator()
+	menuStatus = systray.AddMenuItem("Status: Disconnected", "")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("Quit", "Exit the application")
+
+	// Desabilitar click nos items de info
+	menuCPU.Disable()
+	menuRAM.Disable()
+	menuGPU.Disable()
+	menuStatus.Disable()
+
+	// WebSocket loop em goroutine
+	go func() {
+		for {
+			err := run()
+			if err != nil {
+				log.Printf("Connection error: %v. Reconnecting in 5s...", err)
+				setStatus("Disconnected")
+			}
+			time.Sleep(5 * time.Second)
 		}
-		time.Sleep(5 * time.Second)
+	}()
+
+	// Quit handler
+	go func() {
+		<-mQuit.ClickedCh
+		systray.Quit()
+	}()
+}
+
+func onExit() {
+	os.Exit(0)
+}
+
+func setStatus(status string) {
+	menuMu.Lock()
+	defer menuMu.Unlock()
+	menuStatus.SetTitle(fmt.Sprintf("Status: %s", status))
+}
+
+func updateMenuMetrics(m Metrics) {
+	menuMu.Lock()
+	defer menuMu.Unlock()
+	menuCPU.SetTitle(fmt.Sprintf("CPU: %.1f%%", m.CPU))
+	menuRAM.SetTitle(fmt.Sprintf("RAM: %.1f%% (%d MB / %d MB)", m.RAM, m.RAMUsedMB, m.RAMTotalMB))
+	if m.GPU >= 0 {
+		menuGPU.SetTitle(fmt.Sprintf("GPU: %.0f%%", m.GPU))
+	} else {
+		menuGPU.SetTitle("GPU: N/A")
 	}
 }
 
 func run() error {
 	log.Printf("Connecting to %s...", apiURL)
+	setStatus("Connecting...")
 
 	conn, _, err := websocket.DefaultDialer.Dial(apiURL, nil)
 	if err != nil {
@@ -78,6 +145,7 @@ func run() error {
 	}
 
 	log.Println("Authenticated successfully")
+	setStatus("Connected")
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -97,13 +165,11 @@ func run() error {
 
 func sendMetrics(conn *websocket.Conn) error {
 	metrics := collectMetrics()
+	updateMenuMetrics(metrics)
 
 	if err := conn.WriteJSON(metrics); err != nil {
 		return fmt.Errorf("send metrics: %w", err)
 	}
-
-	log.Printf("CPU: %.1f%% | RAM: %.1f%% (%d MB / %d MB) | GPU: %.0f%%",
-		metrics.CPU, metrics.RAM, metrics.RAMUsedMB, metrics.RAMTotalMB, metrics.GPU)
 
 	return nil
 }
@@ -136,6 +202,7 @@ func getNvidiaGPU() (float64, bool) {
 		"--query-gpu=utilization.gpu",
 		"--format=csv,noheader,nounits",
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
