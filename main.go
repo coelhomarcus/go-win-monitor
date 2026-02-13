@@ -20,7 +20,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-//go:embed icon.ico
+//go:embed app.ico
 var iconData []byte
 
 type Metrics struct {
